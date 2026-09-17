@@ -57,10 +57,17 @@ def init_db():
                 nth INTEGER,                    -- для kind='nth': 1..4 або -1 (останній)
                 weekday INTEGER,                -- 0=Пн .. 6=Нд
                 event_time TEXT NOT NULL,       -- HH:MM
+                warn_text TEXT,                 -- текст попередження за 1 день
+                soon_text TEXT,                 -- текст повідомлення з посиланням
                 notified_day TEXT,              -- дата події, для якої надіслано нагадування за день
                 notified_soon TEXT              -- дата події, для якої надіслано посилання
             )
         """)
+        # міграція старих баз: додаємо колонки, якщо їх ще немає
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(events)")}
+        for col in ("warn_text", "soon_text", "notified_day", "notified_soon"):
+            if col not in cols:
+                conn.execute(f"ALTER TABLE events ADD COLUMN {col} TEXT")
 
 
 # ------------------------------------------------- обчислення дат (правила)
@@ -101,6 +108,14 @@ def next_occurrence(ev, from_dt: datetime.datetime) -> datetime.datetime | None:
     return None
 
 
+def fill_template(text: str, ev, url=True) -> str:
+    """Підставляє плейсхолдери {час}, {правило}, {посилання} у текст."""
+    return (text
+            .replace("{час}", ev["event_time"])
+            .replace("{правило}", rule_label(ev))
+            .replace("{посилання}", ev["conference_url"] if url else ""))
+
+
 # ---------------------------------------------------------------- FSM-стани
 
 class CreateEvent(StatesGroup):
@@ -110,6 +125,8 @@ class CreateEvent(StatesGroup):
     choosing_weekday = State()
     choosing_time = State()
     asking_url = State()
+    asking_warn_text = State()
+    asking_soon_text = State()
     asking_group = State()
 
 
@@ -257,6 +274,36 @@ async def ask_url(m: Message, state: FSMContext):
     if not m.text.startswith("http"):
         return await m.answer("Це не схоже на посилання. Надішліть посилання, починаючи з http")
     await state.update_data(conference_url=m.text.strip())
+    await state.set_state(CreateEvent.asking_warn_text)
+    await m.answer(
+        "✍️ Тепер напишіть текст ПОПЕРЕДЖЕННЯ (прийде за 1 день до конференції).\n\n"
+        "Можна використовувати плейсхолдери:\n"
+        "{час} — час події (напр. 18:30)\n"
+        "{правило} — правило події (напр. «кожна 3-тя Ср місяця»)\n\n"
+        "Приклад: «📢 Нагадуємо: завтра о {час} — конференція!»\n"
+        "Або надішліть /skip щоб використати типовий текст."
+    )
+
+
+@dp.message(CreateEvent.asking_warn_text)
+async def ask_warn_text(m: Message, state: FSMContext):
+    text = None if m.text == "/skip" else m.text
+    await state.update_data(warn_text=text)
+    await state.set_state(CreateEvent.asking_soon_text)
+    await m.answer(
+        "✍️ Тепер напишіть текст ПОВІДОМЛЕННЯ З ПОСИЛАННЯМ "
+        f"(прийде за {REMIND_MINUTES} хв до початку).\n\n"
+        "Плейсхолдери: {час}, {правило}, {посилання} — посилання на конференцію.\n\n"
+        "Приклад: «🔔 Конференція о {час} починається за 15 хв! "
+        "Приєднуйтеся: {посилання}»\n"
+        "Або надішліть /skip щоб використати типовий текст."
+    )
+
+
+@dp.message(CreateEvent.asking_soon_text)
+async def ask_soon_text(m: Message, state: FSMContext):
+    text = None if m.text == "/skip" else m.text
+    await state.update_data(soon_text=text)
     await state.set_state(CreateEvent.asking_group)
     await m.answer(
         "Тепер додайте бота до потрібної групи та перешліть сюди будь-яке "
@@ -284,11 +331,11 @@ async def save_group(m: Message, state: FSMContext, group_id: int):
     with db() as conn:
         conn.execute(
             """INSERT INTO events (title, conference_url, group_id, kind,
-               event_date, nth, weekday, event_time)
-               VALUES (?,?,?,?,?,?,?,?)""",
+               event_date, nth, weekday, event_time, warn_text, soon_text)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
             ("Конференція", data["conference_url"], group_id, data["kind"],
              data.get("event_date"), data.get("nth"), data.get("weekday"),
-             data["event_time"]),
+             data["event_time"], data.get("warn_text"), data.get("soon_text")),
         )
         ev = conn.execute("SELECT * FROM events WHERE id=last_insert_rowid()").fetchone()
     rule = (data.get("event_date") if data["kind"] == "once"
@@ -361,11 +408,11 @@ async def check_and_notify(bot: Bot):
         # 1) попередження за 1 день
         day_due = nxt - datetime.timedelta(days=1)
         if now >= day_due and ev["notified_day"] != key:
+            text = ev["warn_text"] or (
+                f"📅 Попередження: завтра о {ev['event_time']} — конференція.\n"
+                f"Правило: {rule}. Посилання надійде за {REMIND_MINUTES} хв до початку.")
             try:
-                await bot.send_message(
-                    ev["group_id"],
-                    f"📅 Попередження: завтра о {ev['event_time']} — конференція.\n"
-                    f"Правило: {rule}. Посилання надійде за {REMIND_MINUTES} хв до початку.")
+                await bot.send_message(ev["group_id"], fill_template(text, ev, url=False))
                 with db() as conn:
                     conn.execute("UPDATE events SET notified_day=? WHERE id=?",
                                  (key, ev["id"]))
@@ -376,11 +423,11 @@ async def check_and_notify(bot: Bot):
         # 2) посилання за N хвилин до початку
         soon_due = nxt - datetime.timedelta(minutes=REMIND_MINUTES)
         if now >= soon_due and ev["notified_soon"] != key:
+            text = ev["soon_text"] or (
+                f"🔔 Через {REMIND_MINUTES} хв — {rule} о {ev['event_time']}\n"
+                f"Приєднуйтеся: {ev['conference_url']}")
             try:
-                await bot.send_message(
-                    ev["group_id"],
-                    f"🔔 Через {REMIND_MINUTES} хв — {rule} о {ev['event_time']}\n"
-                    f"Приєднуйтеся: {ev['conference_url']}")
+                await bot.send_message(ev["group_id"], fill_template(text, ev))
                 with db() as conn:
                     conn.execute("UPDATE events SET notified_soon=? WHERE id=?",
                                  (key, ev["id"]))
