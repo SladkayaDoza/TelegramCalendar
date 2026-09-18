@@ -52,6 +52,7 @@ def init_db():
                 title TEXT NOT NULL,
                 conference_url TEXT NOT NULL,
                 group_id INTEGER NOT NULL,
+                topic_id INTEGER,                 -- ID топіка (якщо група з топіками)
                 kind TEXT NOT NULL,             -- 'once' | 'nth'
                 event_date TEXT,                -- для kind='once', YYYY-MM-DD
                 nth INTEGER,                    -- для kind='nth': 1..4 або -1 (останній)
@@ -65,7 +66,8 @@ def init_db():
         """)
         # міграція старих баз: додаємо колонки, якщо їх ще немає
         cols = {r[1] for r in conn.execute("PRAGMA table_info(events)")}
-        for col in ("warn_text", "soon_text", "notified_day", "notified_soon"):
+        for col in ("warn_text", "soon_text", "notified_day", "notified_soon",
+                    "topic_id"):
             if col not in cols:
                 conn.execute(f"ALTER TABLE events ADD COLUMN {col} TEXT")
 
@@ -282,10 +284,7 @@ async def ask_url(m: Message, state: FSMContext):
         "{правило} — правило події (напр. «кожна 3-тя Ср місяця»)\n\n"
         "Приклад: «📢 Нагадуємо: завтра о {час} — конференція!»\n"
         "Або надішліть /skip щоб використати типовий текст."
-    )
-
-
-@dp.message(CreateEvent.asking_warn_text)
+    )@dp.message(CreateEvent.asking_warn_text)
 async def ask_warn_text(m: Message, state: FSMContext):
     text = None if m.text == "/skip" else m.text
     await state.update_data(warn_text=text)
@@ -306,34 +305,70 @@ async def ask_soon_text(m: Message, state: FSMContext):
     await state.update_data(soon_text=text)
     await state.set_state(CreateEvent.asking_group)
     await m.answer(
-        "Тепер додайте бота до потрібної групи та перешліть сюди будь-яке "
-        "повідомлення з цієї групи (або її числовий ID, якщо знаєте).\n\n"
-        "⚠️ У групі бот має бути адміністратором, щоб писати повідомлення."
+        "Тепер скажіть, куди надсилати нагадування. Можна одним із способів:\n\n"
+        "1️⃣ Переслати будь-яке повідомлення з групи (бот визначить групу);\n"
+        "2️⃣ Надіслати посилання на топік, напр. https://t.me/c/1662800810/1\n"
+        "   (число в кінці — ID топіка, нагадування прийдуть саме в нього);\n"
+        "3️⃣ Надіслати ID групи числом, напр. -1001662800810\n"
+        "   або з топіком через двокрапку: -1001662800810:1\n\n"
+        "⚠️ Бот має бути адміністратором групи (або хоча б топіка), щоб писати."
     )
 
 
 @dp.message(CreateEvent.asking_group, F.forward_from_chat)
 async def group_from_forward(m: Message, state: FSMContext):
-    await save_group(m, state, m.forward_from_chat.id)
+    await save_group(m, state, m.forward_from_chat.id, None)
+
+
+def parse_group_input(text: str):
+    """Парсить ввід користувача: посилання на топік, 'id:topic' або просто id.
+    Повертає (group_id, topic_id або None) або None, якщо не розпізнано."""
+    import re
+    text = text.strip()
+    # https://t.me/c/1662800810/1  або  https://t.me/#topic_ID/...
+    mt = re.search(r"t\.me/c/(\d+)/(\d+)", text)
+    if mt:
+        return int(f"-100{mt.group(1)}"), int(mt.group(2))
+    # посилання на публічну групу з топіком: t.me/username/123 → 123 це topic_id,
+    # але username треба конвертувати в id — бот зробить це через get_chat нижче
+    mt = re.search(r"t\.me/([A-Za-z_0-9]+)", text)
+    if mt:
+        return mt.group(1), None
+    # числовий ID [: topic]
+    mt = re.fullmatch(r"(-?\d+)(?::(\d+))?", text)
+    if mt:
+        gid = int(mt.group(1))
+        if gid > 0 and str(gid).startswith("100"):
+            gid = int(f"-{gid}")  # хтось надіслав 100xxxxxxxx без мінуса
+        return gid, int(mt.group(2)) if mt.group(2) else None
+    return None
 
 
 @dp.message(CreateEvent.asking_group)
 async def group_from_text(m: Message, state: FSMContext):
-    try:
-        chat_id = int(m.text.strip())
-    except ValueError:
-        return await m.answer("Не зрозумів. Перешліть повідомлення з групи або надішліть її ID числом.")
-    await save_group(m, state, chat_id)
+    parsed = parse_group_input(m.text)
+    if parsed is None:
+        return await m.answer(
+            "Не зрозумів. Перешліть повідомлення з групи, надішліть посилання "
+            "на топік (https://t.me/c/...) або ID групи числом.")
+    group_id, topic_id = parsed
+    if isinstance(group_id, str):  # username публічної групи
+        try:
+            chat = await m.bot.get_chat(group_id)
+            group_id = chat.id
+        except Exception:
+            return await m.answer("Не вдалося знайти таку групу. Бот доданий до неї?")
+    await save_group(m, state, group_id, topic_id)
 
 
-async def save_group(m: Message, state: FSMContext, group_id: int):
+async def save_group(m: Message, state: FSMContext, group_id: int, topic_id):
     data = await state.get_data()
     with db() as conn:
         conn.execute(
-            """INSERT INTO events (title, conference_url, group_id, kind,
+            """INSERT INTO events (title, conference_url, group_id, topic_id, kind,
                event_date, nth, weekday, event_time, warn_text, soon_text)
-               VALUES (?,?,?,?,?,?,?,?,?,?)""",
-            ("Конференція", data["conference_url"], group_id, data["kind"],
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            ("Конференція", data["conference_url"], group_id, topic_id, data["kind"],
              data.get("event_date"), data.get("nth"), data.get("weekday"),
              data["event_time"], data.get("warn_text"), data.get("soon_text")),
         )
@@ -341,17 +376,26 @@ async def save_group(m: Message, state: FSMContext, group_id: int):
     rule = (data.get("event_date") if data["kind"] == "once"
             else nth_rule_label(data["nth"], data["weekday"]))
     nxt = next_occurrence(ev, datetime.datetime.now())
+    place = f"група {group_id}" + (f", топік {topic_id}" if topic_id else "")
     try:
-        await m.bot.send_message(
-            group_id, "✅ Бота підключено до цієї групи. Він нагадуватиме "
-                      "про конференції: за день та перед початком.")
+        await send_to_event_chat(m.bot, group_id, topic_id,
+                                 "✅ Бота підключено. Він нагадуватиме про конференції: "
+                                 "за день та перед початком.")
     except Exception as e:
-        logging.error("Не зміг написати до групи %s: %s", group_id, e)
+        logging.error("Не зміг написати до %s: %s", place, e)
     await state.clear()
     await m.answer(f"✅ Подію створено!\n"
                    f"Правило: {rule}\nЧас: {data['event_time']}\n"
-                   f"Наступна: {nxt:%d.%m.%Y %H:%M}\n"
+                   f"Наступна: {nxt:%d.%m.%Y %H:%M}\nКуди: {place}\n"
                    f"Нагадування: за 1 день та за {REMIND_MINUTES} хв до початку.")
+
+
+async def send_to_event_chat(bot: Bot, group_id: int, topic_id, text: str):
+    """Надсилає повідомлення в групу (або в конкретний топік, якщо вказано)."""
+    if topic_id:
+        await bot.send_message(group_id, text, message_thread_id=int(topic_id))
+    else:
+        await bot.send_message(group_id, text)
 
 
 @dp.message(Command("list"))
@@ -412,7 +456,8 @@ async def check_and_notify(bot: Bot):
                 f"📅 Попередження: завтра о {ev['event_time']} — конференція.\n"
                 f"Правило: {rule}. Посилання надійде за {REMIND_MINUTES} хв до початку.")
             try:
-                await bot.send_message(ev["group_id"], fill_template(text, ev, url=False))
+                await send_to_event_chat(bot, ev["group_id"], ev["topic_id"],
+                                         fill_template(text, ev, url=False))
                 with db() as conn:
                     conn.execute("UPDATE events SET notified_day=? WHERE id=?",
                                  (key, ev["id"]))
@@ -427,7 +472,8 @@ async def check_and_notify(bot: Bot):
                 f"🔔 Через {REMIND_MINUTES} хв — {rule} о {ev['event_time']}\n"
                 f"Приєднуйтеся: {ev['conference_url']}")
             try:
-                await bot.send_message(ev["group_id"], fill_template(text, ev))
+                await send_to_event_chat(bot, ev["group_id"], ev["topic_id"],
+                                         fill_template(text, ev))
                 with db() as conn:
                     conn.execute("UPDATE events SET notified_soon=? WHERE id=?",
                                  (key, ev["id"]))
